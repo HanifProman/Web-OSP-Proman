@@ -594,6 +594,9 @@ function registerNewUserGas(userData) {
   var lock = LockService.getScriptLock();
   try {
     if (!userData) return { success: false, message: 'Data registrasi tidak valid.' };
+    if (!isValidIndonesianPhoneGas_(userData.phoneNumber)) {
+      return { success: false, message: 'Nomor HP tidak valid. Gunakan nomor seluler Indonesia, contoh 081234567890 (10-13 digit).' };
+    }
     lock.waitLock(10000);
     var ss = getSpreadsheet();
     if (!ss) return { success: false, message: 'Spreadsheet tidak ditemukan.' };
@@ -622,6 +625,14 @@ function registerNewUserGas(userData) {
     userData.telegramChatId = resolveTelegramChatIdGas_(userData);
     var result = saveUserRegistrationGas(userData);
     if (!result || !result.success) return result || { success: false, message: 'Gagal menyimpan registrasi.' };
+    try { SpreadsheetApp.flush(); } catch (eFlush) {}
+    try { lock.releaseLock(); } catch (eRel) {}
+    try {
+      var notifRes = notifyAdminNewRegistrationGas_(userData);
+      if (!notifRes || !notifRes.success) {
+        try { logAuditGas({ name: 'SYSTEM', role: 'System' }, 'NOTIF_ADMIN_GAGAL', '', 'Notifikasi registrasi ' + (userData.name || '-') + ' gagal: ' + JSON.stringify(notifRes || {}).substring(0, 300)); } catch (eLog) {}
+      }
+    } catch (eNotifAdm) { Logger.log('notifyAdminNewRegistrationGas_ gagal: ' + eNotifAdm); }
     return { success: true, message: 'Registrasi berhasil disimpan dan menunggu persetujuan Admin.' };
   } catch (err) {
     Logger.log('registerNewUserGas error: ' + err);
@@ -631,11 +642,70 @@ function registerNewUserGas(userData) {
   }
 }
 
+/**
+ * Kirim notifikasi Telegram ke Admin saat ada pengajuan registrasi user baru.
+ * Chat ID admin diambil dari Script Property ADMIN_TELEGRAM_CHAT_ID (terisi saat admin /start bot).
+ */
+function getAdminChatIdsGas_() {
+  var ids = [];
+  function add(v) { v = String(v == null ? '' : v).trim(); if (isRealTelegramChatIdGas_(v) && ids.indexOf(v) < 0) ids.push(v); }
+  try { add(PropertiesService.getScriptProperties().getProperty('ADMIN_TELEGRAM_CHAT_ID')); } catch (e1) {}
+  try {
+    var cache = CacheService.getScriptCache();
+    add(cache.get('TELE_CHAT_ADMIN'));
+    add(cache.get('TELE_CHAT_mhaniifa'));
+    add(PropertiesService.getScriptProperties().getProperty('TELE_CHAT_mhaniifa'));
+  } catch (e2) {}
+  try {
+    var users = getRegisteredUsersGas() || [];
+    for (var i = 0; i < users.length; i++) {
+      if (String(users[i].role || '').toLowerCase() === 'admin') {
+        add(users[i].telegramChatId);
+        add(resolveTelegramChatIdGas_(users[i]));
+      }
+    }
+  } catch (e3) {}
+  return ids;
+}
+
+function notifyAdminNewRegistrationGas_(userData) {
+  var chats = getAdminChatIdsGas_();
+  if (chats.length === 0) {
+    try { logAuditGas({ name: 'System' }, 'NOTIF_ADMIN_FAILED', '', 'Chat ID Admin belum diketahui. Admin harus menekan /start pada bot. Registrasi: ' + (userData && userData.name)); } catch (eL) {}
+    return { success: false, reason: 'NO_ADMIN_CHAT' };
+  }
+  var appUrl = '';
+  try { appUrl = ScriptApp.getService().getUrl() || ''; } catch (e2) {}
+  var msg = '🆕 <b>Pengajuan Registrasi User Baru</b>\n' +
+    'Nama: <b>' + escapeTelegramHtml_(userData.name || '-') + '</b>\n' +
+    'Role: ' + escapeTelegramHtml_([userData.role, userData.supervisorType].filter(Boolean).join(' / ') || '-') + '\n' +
+    'Mitra/SUBCON: ' + escapeTelegramHtml_(userData.subcon || '-') + '\n' +
+    'No HP: ' + escapeTelegramHtml_(userData.phoneNumber || '-') + '\n' +
+    'Telegram: ' + escapeTelegramHtml_(userData.telegramUsername || '-') + '\n\n' +
+    (appUrl ? '<a href="' + appUrl + '">Buka aplikasi &amp; proses persetujuan</a>' : 'Buka aplikasi untuk memproses persetujuan.');
+  var okCount = 0, lastRes = null;
+  for (var i = 0; i < chats.length; i++) {
+    var res = sendTelegramMessageGas(chats[i], msg);
+    lastRes = res;
+    if (res && res.success) okCount++;
+  }
+  if (okCount === 0) {
+    try { logAuditGas({ name: 'System' }, 'NOTIF_ADMIN_FAILED', '', 'Telegram gagal: ' + JSON.stringify(lastRes).substring(0, 300)); } catch (eL2) {}
+  }
+  return { success: okCount > 0, sent: okCount };
+}
+
 function normalizeUserPhoneGas_(value) {
   var phone = String(value || '').replace(/[^0-9]/g, '');
   if (phone.indexOf('62') === 0) phone = '0' + phone.substring(2);
   return phone;
 }
+
+/** Nomor HP seluler Indonesia valid: 08xx / +628xx / 628xx, total 10-13 digit setelah dinormalisasi. */
+function isValidIndoMobilePhoneGas_(value) {
+  return /^08\d{8,11}$/.test(normalizeUserPhoneGas_(value));
+}
+function isValidIndonesianPhoneGas_(value) { return isValidIndoMobilePhoneGas_(value); }
 
 /** Escape teks agar aman dipakai pada pesan Telegram parse_mode HTML. */
 function escapeTelegramHtml_(value) {
@@ -1063,6 +1133,9 @@ function sendTelegramOtpGas(identifier, telegramUsername, optionalOtp) {
     if (userPhone) cache.put('PENDING_OTP_' + userPhone, otp, 600);
 
     var chatId = resolveTelegramChatIdGas_(matchedUser);
+    if (chatId && isAdminOwner) {
+      try { PropertiesService.getScriptProperties().setProperty('ADMIN_TELEGRAM_CHAT_ID', chatId); } catch (ePA) {}
+    }
     if (!chatId && isAdminOwner) {
       try {
         chatId = String(PropertiesService.getScriptProperties().getProperty('ADMIN_TELEGRAM_CHAT_ID') || '');
@@ -1146,6 +1219,22 @@ function sendRegistrationOtpGas(identifier, telegramUsername) {
     if (!phone || !tele) {
       return { success: false, otpSentToTelegram: false, message: 'Nomor HP dan username Telegram wajib diisi untuk menerima OTP.' };
     }
+    if (!/^[a-z0-9_]{5,32}$/.test(tele)) {
+      return { success: false, otpSentToTelegram: false, message: 'Username Telegram tidak valid (5-32 karakter huruf/angka/underscore).' };
+    }
+    try {
+      var existing = getRegisteredUsersGas() || [];
+      for (var ei = 0; ei < existing.length; ei++) {
+        var exPhone = normalizeUserPhoneGas_(existing[ei].phoneNumber || '');
+        var exTele = String(existing[ei].telegramUsername || '').replace(/^@/, '').toLowerCase().trim();
+        if ((exPhone && exPhone === phone) || (exTele && exTele === tele)) {
+          return { success: false, duplicate: true, otpSentToTelegram: false, message: 'Nomor HP atau username Telegram sudah terdaftar. Silakan login.' };
+        }
+      }
+    } catch (eDup) { Logger.log('cek duplikat OTP registrasi: ' + eDup); }
+    if (!isValidIndonesianPhoneGas_(phone)) {
+      return { success: false, otpSentToTelegram: false, message: 'Nomor HP tidak valid. Gunakan nomor seluler Indonesia, contoh 081234567890 (10-13 digit).' };
+    }
     var otp = String(Math.floor(100000 + Math.random() * 900000));
     var cache = CacheService.getScriptCache();
     cache.put('OTP_' + phone, otp, 600);
@@ -1221,7 +1310,7 @@ function verifyTelegramOtpGas(identifier, otpCode) {
  * - Dilengkapi Anti-Spam & Deduplikasi update_id agar Telegram TIDAK mengulang kirim pesan (retry loop)
  * - Otomatis mencatat Chat ID saat user /start atau berbagi kontak
  * - Mengirimkan pending OTP secara instan jika user sedang login di web
- * - Menangani tombol "📱 Bagikan Nomor HP" (message.contact)
+ * - Tombol "Bagikan Nomor HP" sudah dihapus; validasi lewat username Telegram
  */
 function doPost(e) {
   try {
@@ -1289,6 +1378,7 @@ function doPost(e) {
       }
 
       // Otomatis sinkronkan Chat ID ke sheet Users
+      var matchedRegisteredUser = '';
       try {
         var ss = getSpreadsheet();
         if (ss) {
@@ -1305,6 +1395,7 @@ function doPost(e) {
                 if (teleUsername) userSheet.getRange(i + 1, 14).setValue(teleUsername);
                 userSheet.getRange(i + 1, 15).setValue(String(chatId));
                 userSheet.getRange(i + 1, 16).setValue('TRUE');
+                matchedRegisteredUser = String(uData[i][0] || 'Rekan');
                 break;
               }
             }
@@ -1353,74 +1444,33 @@ function doPost(e) {
         return ContentService.createTextOutput(JSON.stringify({ ok: true, status: 'throttled' }))
           .setMimeType(ContentService.MimeType.JSON);
       }
-      cache.put(startThrottleKey, '1', 30);
+      cache.put(startThrottleKey, '1', 5);
 
-      var welcomeText = '👋 <b>Halo, ' + (fromUser.first_name || 'Rekan') + '!</b>\n\n' +
-        'Selamat datang di <b>Bot Verifikasi Web OSP Project Reporter</b>.\n\n' +
-        'Akun Telegram Anda (' + (teleUsername || fromUser.first_name) + ') telah terhubung ke sistem.\n' +
-        'Untuk memverifikasi nomor telepon, silakan tekan tombol <b>📱 Bagikan Nomor HP</b> di bawah ini:';
-
-      var keyboard = {
-        keyboard: [
-          [{ text: '📱 Bagikan Nomor HP', request_contact: true }]
-        ],
-        resize_keyboard: true,
-        one_time_keyboard: true
-      };
-
-      sendTelegramMessageGas(chatId, welcomeText, keyboard);
-      return ContentService.createTextOutput(JSON.stringify({ ok: true })).setMimeType(ContentService.MimeType.JSON);
+      // Tanpa tombol "Bagikan Nomor HP": identitas divalidasi lewat username Telegram
+      // (harus sama dengan yang didaftarkan) atau deep-link /start <nomor HP> dari aplikasi.
+      var startReply;
+      if (matchedRegisteredUser) {
+        startReply = '✅ <b>Halo, ' + escapeTelegramHtml_(fromUser.first_name || matchedRegisteredUser) + '!</b>\n\n' +
+          'Akun Telegram ' + (teleUsername || '') + ' sudah terhubung dengan akun <b>' + escapeTelegramHtml_(matchedRegisteredUser) + '</b>.\n' +
+          'Kembali ke aplikasi lalu minta kode OTP. Kode akan dikirim otomatis ke chat ini.';
+      } else if (!cleanUser && !deepPhone) {
+        startReply = '⚠️ Akun Telegram Anda belum memiliki <b>username</b>.\n\n' +
+          'Buat username di Telegram (Settings → Username), daftarkan username tersebut di aplikasi, lalu tekan /start lagi.';
+      } else {
+        startReply = '👋 <b>Halo, ' + escapeTelegramHtml_(fromUser.first_name || 'Rekan') + '!</b>\n\n' +
+          'Akun Telegram ' + (teleUsername || '') + ' sudah tercatat oleh bot.\n' +
+          'Kembali ke aplikasi dan minta kode OTP; kode akan dikirim otomatis ke chat ini. ' +
+          'Pastikan username Telegram yang Anda isi di aplikasi sama persis dengan akun ini.';
+      }
+      sendTelegramMessageGas(chatId, startReply, { remove_keyboard: true });
+      return ContentService.createTextOutput(JSON.stringify({ ok: true, userMatched: !!matchedRegisteredUser })).setMimeType(ContentService.MimeType.JSON);
     }
 
-    // 3. User membagikan kontak (Nomor HP) melalui tombol
+    // 3. Kontak (tombol "Bagikan Nomor HP") sudah tidak dipakai lagi. Cukup hapus keyboard lama
+    // yang mungkin masih tampil di chat user, tanpa memproses nomor.
     if (message.contact) {
-      var contactPhone = message.contact.phone_number || '';
-      var cleanContactPhone = contactPhone.replace(/[^0-9]/g, '');
-      if (cleanContactPhone.indexOf('62') === 0) {
-        cleanContactPhone = '0' + cleanContactPhone.slice(2);
-      }
-
-      if (cleanContactPhone) {
-        cache.put('TELE_CHAT_PHONE_' + cleanContactPhone, String(chatId), 86400);
-        try { PropertiesService.getScriptProperties().setProperty('TELE_CHAT_PHONE_' + cleanContactPhone, String(chatId)); } catch (ePropPhone) {}
-      }
-
-      // Generate OTP verifikasi
-      var otpCode = String(Math.floor(100000 + Math.random() * 900000));
-      cache.put('OTP_' + cleanContactPhone, otpCode, 600);
-      if (cleanUser) cache.put('OTP_' + cleanUser, otpCode, 600);
-
-      // Simpan Chat ID ke sheet Users jika nomor sudah ada di registrasi
-      try {
-        var ss = getSpreadsheet();
-        if (ss) {
-          var userSheet = ss.getSheetByName(SHEET_USERS);
-          if (userSheet) {
-            var uData = userSheet.getDataRange().getValues();
-            for (var i = 1; i < uData.length; i++) {
-              var rowPhone = normalizeUserPhoneGas_(uData[i][12] || '');
-              if (rowPhone && rowPhone === cleanContactPhone) {
-                if (teleUsername) userSheet.getRange(i + 1, 14).setValue(teleUsername);
-                userSheet.getRange(i + 1, 15).setValue(String(chatId));
-                userSheet.getRange(i + 1, 16).setValue('TRUE');
-                break;
-              }
-            }
-          }
-        }
-      } catch (sheetErr) {
-        Logger.log('Gagal update sheet pada contact: ' + sheetErr);
-      }
-
-      var successMsg = '✅ <b>NOMOR HP TERVERIFIKASI!</b>\n\n' +
-        'Nomor: <code>' + contactPhone + '</code>\n' +
-        'Telegram: ' + (teleUsername || fromUser.first_name) + '\n\n' +
-        'Kode OTP Verifikasi Anda:\n' +
-        '👉 <code>' + otpCode + '</code> 👈\n\n' +
-        'Silakan masukkan 6 digit kode OTP di atas ke aplikasi Infranexia untuk melanjutkan.';
-
-      sendTelegramMessageGas(chatId, successMsg);
-      return ContentService.createTextOutput(JSON.stringify({ ok: true })).setMimeType(ContentService.MimeType.JSON);
+      sendTelegramMessageGas(chatId, 'Verifikasi nomor HP lewat bot sudah tidak diperlukan. Kembali ke aplikasi dan minta kode OTP; kode dikirim ke chat ini.', { remove_keyboard: true });
+      return ContentService.createTextOutput(JSON.stringify({ ok: true, contactIgnored: true })).setMimeType(ContentService.MimeType.JSON);
     }
 
     // 4. User mengirim pesan teks bebas (misal: "otp", "kode", "halo", dsb.)
@@ -1620,6 +1670,7 @@ function getMasterSites() {
   var idxTglSp = findCol(['TGL SP', 'TANGGAL SP', 'DATE SP', 'TGL_SP'], 8);
   var idxNilaiPlan = findCol(['NILAI PLAN', 'PLAN VALUE', 'PLAN'], 9);
   var idxNilaiDrm = findCol(['NILAI DRM', 'DRM VALUE', 'DRM'], 10);
+  var idxLastReporter = findCol(['LAST REPORTER', 'LAST_REPORTER', 'LASTREPORTER'], -1);
   var idxTipeFo = findCol(['TIPE FO', 'TYPE FO', 'JENIS FO', 'FO TYPE', 'KABEL FO'], 11);
   var idxCatTipeFo = findCol([
     'CAT TIPE FO', 'CAT TYPE FO', 'CAT FO', 'CATEGORY FO', 'CAT TIPE',
@@ -1655,7 +1706,7 @@ function getMasterSites() {
   // Ambil baris data
   var maxColNeeded = Math.max(
     idxId, idxRegion, idxBranch, idxSiteName, idxTikor, idxTp, idxSow, idxNoSp, idxTglSp,
-    idxNilaiPlan, idxNilaiDrm, idxTipeFo, idxCatTipeFo, idxNilaiPrelim, idxMitra, idxSubcon,
+    idxNilaiPlan, idxNilaiDrm, idxLastReporter, idxTipeFo, idxCatTipeFo, idxNilaiPrelim, idxMitra, idxSubcon,
     idxStatus, idxSubStatus, idxDetilProgress, idxRemarksEd, idxTgtTiang, idxRealTiang,
     idxTgtGalian, idxRealGalian, idxTgtFo, idxRealFo, idxTglCommitOaFix, idxRekapAging, idxEvidenceLink,
     idxSupervisor, idxBatchWo
@@ -1733,6 +1784,7 @@ function getMasterSites() {
       tglSp: formatGasDate(row[idxTglSp]),
       nilaiPlan: Number(row[idxNilaiPlan]) || 0,
       nilaiDrm: Number(row[idxNilaiDrm]) || 0,
+      lastReporter: (idxLastReporter >= 0 && row[idxLastReporter] != null) ? String(row[idxLastReporter]).trim() : '',
       tipeFo: row[idxTipeFo] ? String(row[idxTipeFo]).trim() : '',
       catTipeFo: normCatFo,
       nilaiPrelim: Number(row[idxNilaiPrelim]) || 0,
@@ -1887,34 +1939,137 @@ function getAppData() {
   }
 }
 
+/** Normalisasi nama mitra/SUBCON untuk perbandingan (hapus PT/CV/UD, spasi, simbol). */
+function normalizeMitraNameGas_(v) {
+  return String(v == null ? '' : v).toUpperCase().replace(/\b(PT|CV|UD)\b\.?/g, ' ').replace(/[^A-Z0-9]/g, '');
+}
+
+/** Dua nama mitra dianggap sama bila hasil normalisasi identik, atau salah satu memuat yang lain (min. 7 karakter). */
+function sameMitraGas_(a, b) {
+  var x = normalizeMitraNameGas_(a), y = normalizeMitraNameGas_(b);
+  if (!x || !y) return false;
+  if (x === y) return true;
+  var shorter = x.length <= y.length ? x : y, longer = x.length <= y.length ? y : x;
+  return shorter.length >= 7 && longer.indexOf(shorter) > -1;
+}
+
+/** Cari user terdaftar (sheet Users) berdasarkan email / nomor HP / id agar role & SUBCON tidak bergantung pada data client. */
+function lookupRegisteredUserGas_(u) {
+  try {
+    if (!u) return null;
+    var email = String(u.email || '').trim().toLowerCase();
+    var phone = normalizeUserPhoneGas_(u.phoneNumber || '');
+    var id = String(u.id || '').trim();
+    var list = getRegisteredUsersGas() || [];
+    for (var i = 0; i < list.length; i++) {
+      var r = list[i];
+      if ((email && String(r.email || '').trim().toLowerCase() === email) ||
+          (phone && normalizeUserPhoneGas_(r.phoneNumber || '') === phone) ||
+          (id && String(r.id || '') === id)) return r;
+    }
+  } catch (e) { Logger.log('lookupRegisteredUserGas_: ' + e); }
+  return null;
+}
+
+function findMasterSiteGas_(siteId) {
+  var id = String(siteId || '').trim().toUpperCase();
+  if (!id) return null;
+  var sites = getMasterSites() || [];
+  for (var i = 0; i < sites.length; i++) {
+    if (String(sites[i].id || '').trim().toUpperCase() === id) return sites[i];
+  }
+  return null;
+}
+
 /**
- * Kirim notifikasi Telegram ke pemeriksa (Supervisor Mitra) saat Tim Lapangan submit report.
- * Target utama: Supervisor Mitra yang dipilih pada form (designatedSpvMitraEmail).
- * Jika tidak ada/tidak ditemukan: semua Supervisor Mitra aktif dengan mitra (subcon) yang sama.
+ * Menentukan jalur pemeriksa report berdasarkan SUBCON submitter vs kolom MITRA site di dataFTTM.
+ * - Tim Lapangan, SUBCON = MITRA   : pemeriksa-1 = SPV Mitra SUBCON (sekaligus approver)
+ * - Tim Lapangan, SUBCON != MITRA  : pemeriksa-1 = SPV Mitra SUBCON, pemeriksa-2/approver = SPV Mitra MITRA
+ * - SPV Mitra,    SUBCON = MITRA   : langsung tercatat di Response (direct)
+ * - SPV Mitra,    SUBCON != MITRA  : pemeriksa-1 sekaligus approver = SPV Mitra MITRA
+ * - Role lain                      : langsung tercatat (perilaku lama)
+ */
+function computeReviewRouteGas_(reportData, submitter) {
+  var su = lookupRegisteredUserGas_(submitter) || submitter || {};
+  var role = String(su.role || (submitter && submitter.role) || '').trim().toLowerCase();
+  var type = String(su.supervisorType || (submitter && submitter.supervisorType) || '').trim().toLowerCase();
+  var isTL = role === 'tim lapangan';
+  var isSpvMitra = role === 'supervisor' && type === 'supervisor mitra';
+  var S = String(su.subcon || (submitter && submitter.subcon) || (reportData && (reportData.subcon || reportData.mitraPelaksana)) || '').trim();
+  var site = null;
+  try { site = findMasterSiteGas_(reportData && reportData.siteId); } catch (e) { Logger.log('computeReviewRouteGas_ site: ' + e); }
+  var M = String((site && site.mitra) || '').trim();
+  var low = M.toLowerCase();
+  var mitraKnown = !!M && M !== '-' && low !== 'null' && low !== 'undefined';
+  var same = !mitraKnown || !S || sameMitraGas_(S, M);
+  var base = { submitterSubcon: S, siteMitra: M, submitterRole: isTL ? 'Tim Lapangan' : (isSpvMitra ? 'Supervisor Mitra' : String(su.role || '')) };
+  if (isTL) {
+    base.mode = 'pending';
+    base.stage1Subcon = S || M;
+    base.stage2Subcon = same ? '' : M;
+    return base;
+  }
+  if (isSpvMitra) {
+    if (same) { base.mode = 'direct'; return base; }
+    base.mode = 'pending';
+    base.stage1Subcon = M;
+    base.stage2Subcon = '';
+    return base;
+  }
+  base.mode = 'direct';
+  return base;
+}
+
+function applyReviewRouteToReportGas_(report, route) {
+  report.reviewStage = 1;
+  report.reviewerSubcon = route.stage1Subcon || '';
+  report.stage1Subcon = route.stage1Subcon || '';
+  report.stage2Subcon = route.stage2Subcon || '';
+  report.siteMitra = route.siteMitra || '';
+  report.submitterSubcon = route.submitterSubcon || '';
+  report.reviewStages = route.stage2Subcon ? 2 : 1;
+  report.designatedSpvMitraEmail = '';
+  delete report.pemeriksa1ApprovedBy; delete report.pemeriksa1ApprovedAt; delete report.pemeriksa1Notes;
+  return report;
+}
+
+/** Hak review report pending: SPV Mitra dengan SUBCON = reviewerSubcon pada tahap berjalan (Admin sebagai cadangan). */
+function canReviewPendingReportGas_(report, reviewer) {
+  var role = String((reviewer && reviewer.role) || '').trim().toLowerCase();
+  if (role === 'admin') return true;
+  var ru = lookupRegisteredUserGas_(reviewer) || reviewer || {};
+  var type = String(ru.supervisorType || (reviewer && reviewer.supervisorType) || '').trim().toLowerCase();
+  if (!(role === 'supervisor' && type === 'supervisor mitra')) return false;
+  if (report && report.reviewerSubcon) return sameMitraGas_(ru.subcon || (reviewer && reviewer.subcon), report.reviewerSubcon);
+  var assigned = String((report && report.designatedSpvMitraEmail) || '').trim().toLowerCase();
+  if (assigned && assigned !== 'skip_spv_mitra') return assigned === String((reviewer && reviewer.email) || '').trim().toLowerCase();
+  return true;
+}
+
+/**
+ * Kirim notifikasi Telegram ke pemeriksa tahap berjalan (SPV Mitra dengan SUBCON = report.reviewerSubcon).
+ * Bila tidak ada SPV Mitra untuk mitra tsb, notifikasi dikirim ke Admin sebagai cadangan.
  */
 function notifyPemeriksaNewReportGas_(report, submitter) {
   try {
     if (!report) return { success: false, reason: 'REPORT_EMPTY' };
     var users = getRegisteredUsersGas() || [];
-    var designated = String(report.designatedSpvMitraEmail || '').trim().toLowerCase();
-    var subcon = String(report.mitraPelaksana || report.subcon || '').trim().toLowerCase();
+    var needSubcon = String(report.reviewerSubcon || report.mitraPelaksana || report.subcon || '').trim();
+    var submitterEmail = String(report.respondentId || report.emailSubmitter || (submitter && submitter.email) || '').trim().toLowerCase();
+    function isApproved(u) { return String(u.status || '').trim().toLowerCase() === 'approved'; }
     function isSpvMitra(u) {
-      return String(u.status || '').trim().toLowerCase() === 'approved' &&
-        String(u.role || '').trim().toLowerCase() === 'supervisor' &&
+      return isApproved(u) && String(u.role || '').trim().toLowerCase() === 'supervisor' &&
         String(u.supervisorType || '').trim().toLowerCase() === 'supervisor mitra';
     }
-    var targets = [];
-    if (designated && designated !== 'skip_spv_mitra') {
-      targets = users.filter(function(u) { return isSpvMitra(u) && String(u.email || '').trim().toLowerCase() === designated; });
+    var targets = users.filter(function(u) {
+      return isSpvMitra(u) && sameMitraGas_(u.subcon, needSubcon) && String(u.email || '').trim().toLowerCase() !== submitterEmail;
+    });
+    var fallbackAdmin = false;
+    if (!targets.length) {
+      targets = users.filter(function(u) { return isApproved(u) && String(u.role || '') === 'Admin'; });
+      fallbackAdmin = true;
     }
-    if (!targets.length && subcon) {
-      targets = users.filter(function(u) {
-        if (!isSpvMitra(u)) return false;
-        var us = String(u.subcon || '').trim().toLowerCase();
-        return !us || us.indexOf(subcon) > -1 || subcon.indexOf(us) > -1;
-      });
-    }
-    if (!targets.length) return { success: false, reason: 'NO_PEMERIKSA_FOUND' };
+    if (!targets.length) return { success: false, reason: 'NO_PEMERIKSA_FOUND', needSubcon: needSubcon };
 
     var appUrl = '';
     try { appUrl = ScriptApp.getService().getUrl() || ''; } catch (urlErr) {}
@@ -1923,13 +2078,17 @@ function notifyPemeriksaNewReportGas_(report, submitter) {
     var firstDate = firstAt ? new Date(firstAt) : new Date();
     if (isNaN(firstDate.getTime())) firstDate = new Date();
     var timeText = Utilities.formatDate(firstDate, 'Asia/Jakarta', 'dd/MM/yyyy HH:mm') + ' WIB';
-    var submitterName = report.submitterName || (submitter && submitter.name) || 'Tim Lapangan';
+    var submitterName = report.submitterName || (submitter && submitter.name) || 'Pengirim';
     var statusText = [report.status, report.subStatus].filter(Boolean).join(' - ');
+    var stageNo = Number(report.reviewStage) || 1;
+    var stageText = (report.reviewStages === 2 || report.stage2Subcon) ? (stageNo === 2 ? 'Pemeriksa-2 / Approver' : 'Pemeriksa-1') : 'Pemeriksa / Approver';
     var message = '📝 <b>Report Baru Menunggu Review Anda</b>\n' +
+      'Peran Anda: <b>' + stageText + '</b>' + (fallbackAdmin ? ' (cadangan Admin: belum ada SPV Mitra ' + escapeTelegramHtml_(needSubcon) + ')' : '') + '\n' +
       'Site: <b>' + escapeTelegramHtml_(report.siteId || '-') + '</b>\n' +
-      'Mitra: ' + escapeTelegramHtml_(report.mitraPelaksana || report.subcon || '-') + '\n' +
+      'Mitra: ' + escapeTelegramHtml_(report.siteMitra || report.mitraPelaksana || report.subcon || '-') + '\n' +
       (statusText ? 'Status: ' + escapeTelegramHtml_(statusText) + '\n' : '') +
-      'Dikirim oleh: ' + escapeTelegramHtml_(submitterName) + '\n' +
+      'Dikirim oleh: ' + escapeTelegramHtml_(submitterName) + (report.submitterSubcon ? ' (' + escapeTelegramHtml_(report.submitterSubcon) + ')' : '') + '\n' +
+      (stageNo === 2 && report.pemeriksa1ApprovedBy ? 'Disetujui Pemeriksa-1: ' + escapeTelegramHtml_(report.pemeriksa1ApprovedBy) + '\n' : '') +
       'Waktu submit: ' + timeText + '\n\n' +
       (directUrl ? '<a href="' + directUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '">Buka & review laporan</a>' : 'Silakan buka tab Review pada aplikasi.');
 
@@ -1940,7 +2099,7 @@ function notifyPemeriksaNewReportGas_(report, submitter) {
       var r = sendTelegramMessageGas(chatId, message);
       if (r && r.success) sent++;
     });
-    return { success: sent > 0, sent: sent, total: targets.length, withoutChatId: noChat };
+    return { success: sent > 0, sent: sent, total: targets.length, withoutChatId: noChat, fallbackAdmin: fallbackAdmin };
   } catch (err) {
     Logger.log('notifyPemeriksaNewReportGas_ error: ' + err);
     return { success: false, error: String(err) };
@@ -2049,7 +2208,16 @@ function savePendingDailyReportCore_(reportData, user) {
   try {
     lock = LockService.getScriptLock(); lock.waitLock(10000);
     if (!reportData || !reportData.submissionId) return { success: false, error: 'Submission ID laporan tidak tersedia.' };
-    if (String((user && user.role) || '').trim().toLowerCase() !== 'tim lapangan') return { success: false, error: 'Fungsi ini hanya untuk laporan Tim Lapangan.' };
+    var submitRole = String((user && user.role) || '').trim().toLowerCase();
+    var submitType = String((user && user.supervisorType) || '').trim().toLowerCase();
+    if (!(submitRole === 'tim lapangan' || (submitRole === 'supervisor' && submitType === 'supervisor mitra'))) return { success: false, error: 'Fungsi ini hanya untuk laporan Tim Lapangan atau Supervisor Mitra.' };
+    var detil = String(reportData.detilProgress == null ? '' : reportData.detilProgress).replace(/[\r\n]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
+    if (detil.length < 10 || detil.length > 100) {
+      return { success: false, code: 'DETIL_PROGRESS_LENGTH', error: 'Detil Progress Kegiatan harus 10-100 karakter (saat ini ' + detil.length + ') dan tanpa baris baru.' };
+    }
+    reportData.detilProgress = detil;
+    var route = computeReviewRouteGas_(reportData, user);
+    if (route.mode === 'direct') return { success: true, direct: true, route: route };
     var sheet = getPendingReportSheetGas_();
     if (!sheet) return { success: false, error: 'Spreadsheet tidak terhubung.' };
     var row = findPendingReportRowGas_(sheet, reportData.submissionId);
@@ -2057,12 +2225,19 @@ function savePendingDailyReportCore_(reportData, user) {
     var report = Object.assign({}, reportData);
     report.firstSubmittedAt = report.firstSubmittedAt || report.submittedAt || now.toISOString();
     report.approvalStatus = report.approvalStatus || 'Pending SPV Mitra';
+    applyReviewRouteToReportGas_(report, route);
     if (row > 0) {
       var old = sheet.getRange(row, 1, 1, 6).getValues()[0];
       var oldStatus = String(old[1] || '').trim().toLowerCase();
       if (oldStatus !== 'pending spv mitra' && oldStatus !== 'rejected by spv mitra') {
         return { success: false, code: 'REPORT_LOCKED_AFTER_SPV_APPROVAL', error: 'Laporan sudah disetujui Supervisor Mitra dan tidak dapat diubah Tim Lapangan.' };
       }
+      try {
+        var oldRoute = JSON.parse(String(old[2] || '{}'));
+        if (oldRoute && Number(oldRoute.reviewStage) >= 2) {
+          return { success: false, code: 'REPORT_LOCKED_AFTER_PEMERIKSA1', error: 'Laporan sudah disetujui Pemeriksa-1 dan tidak dapat diubah lagi.' };
+        }
+      } catch (oldRouteErr) {}
       report.approvalStatus = old[1] || report.approvalStatus;
       // Timestamp submit pertama tidak boleh berubah oleh edit berikutnya.
       try {
@@ -2074,21 +2249,39 @@ function savePendingDailyReportCore_(reportData, user) {
       sheet.appendRow([String(report.submissionId), report.approvalStatus, JSON.stringify(report), now, (user && user.name) || report.submitterName || '', report.siteId || '']);
     }
     SpreadsheetApp.flush();
-    return { success: true, submissionId: report.submissionId, pending: true, isNew: row <= 0, report: report };
+    return { success: true, submissionId: report.submissionId, pending: true, isNew: row <= 0, report: report, route: route };
   } catch (err) {
     Logger.log('savePendingDailyReportGas error: ' + err);
     return { success: false, error: String(err) };
   } finally { if (lock) { try { lock.releaseLock(); } catch (e) {} } }
 }
 
+/** Pemeriksa-1 menyetujui: laporan diteruskan ke Pemeriksa-2 / Approver (belum ditulis ke Response). */
+function advanceReportToStage2Gas_(report, reviewerUser, notes) {
+  var now = new Date();
+  report.reviewStage = 2;
+  report.reviewerSubcon = report.stage2Subcon;
+  report.pemeriksa1ApprovedBy = String((reviewerUser && reviewerUser.name) || '');
+  report.pemeriksa1ApprovedAt = now.toISOString();
+  report.pemeriksa1Notes = notes || 'Disetujui Pemeriksa-1';
+  report.approvalStatus = 'Pending SPV Mitra';
+  return { at: now };
+}
+
+function advanceResultAfterLockGas_(report, advanced) {
+  var notif = null;
+  try { notif = notifyPemeriksaNewReportGas_(report, { name: report.submitterName }); } catch (e) { notif = { success: false, error: String(e) }; }
+  return { success: true, submissionId: report.submissionId, approvalStatus: 'Pending SPV Mitra', advancedToStage2: true, reviewStage: 2, reviewerSubcon: report.reviewerSubcon, pemeriksa1ApprovedBy: report.pemeriksa1ApprovedBy, pemeriksa1ApprovedAt: report.pemeriksa1ApprovedAt, pemeriksa1Notes: report.pemeriksa1Notes, notification: notif };
+}
+
 /** Approve SPV Mitra: kunci draft, sinkronkan versi terbaru ke Response, lalu hapus antrean internal. */
 function approvePendingDailyReportGas(submissionId, reviewerUser, notes, fallbackReport) {
-  var lock = null, report = null, originalStatus = 'Pending SPV Mitra';
+  var lock = null, report = null, originalStatus = 'Pending SPV Mitra', advanced = null;
   try {
     lock = LockService.getScriptLock(); lock.waitLock(10000);
     var reviewerRole = String((reviewerUser && reviewerUser.role) || '').trim().toLowerCase();
     var reviewerType = String((reviewerUser && reviewerUser.supervisorType) || '').trim().toLowerCase();
-    if (!(reviewerRole === 'supervisor' && reviewerType === 'supervisor mitra')) return { success: false, error: 'Hanya Supervisor Mitra yang dapat menyetujui laporan ini.' };
+    if (!(reviewerRole === 'admin' || (reviewerRole === 'supervisor' && reviewerType === 'supervisor mitra'))) return { success: false, error: 'Hanya Supervisor Mitra pemeriksa yang dapat menyetujui laporan ini.' };
     var sheet = getPendingReportSheetGas_();
     if (!sheet) return { success: false, error: 'Sheet antrean laporan tidak tersedia.' };
     var row = findPendingReportRowGas_(sheet, submissionId);
@@ -2098,31 +2291,40 @@ function approvePendingDailyReportGas(submissionId, reviewerUser, notes, fallbac
       if (originalStatus.toLowerCase() !== 'pending spv mitra') return { success: false, error: 'Laporan tidak lagi menunggu approval Supervisor Mitra.' };
       try { report = JSON.parse(String(values[2] || '{}')); } catch (parseErr) { return { success: false, error: 'Data laporan pending tidak valid.' }; }
       if (!report || !report.submissionId) return { success: false, error: 'Data laporan pending tidak lengkap.' };
-      var assignedEmail = String(report.designatedSpvMitraEmail || '').trim().toLowerCase();
-      var reviewerEmail = String((reviewerUser && reviewerUser.email) || '').trim().toLowerCase();
-      if (assignedEmail && assignedEmail !== 'skip_spv_mitra' && assignedEmail !== reviewerEmail) {
-        return { success: false, error: 'Laporan ini ditugaskan kepada Supervisor Mitra lain.' };
+      if (!canReviewPendingReportGas_(report, reviewerUser)) {
+        return { success: false, error: 'Laporan ini ditugaskan kepada Supervisor Mitra lain (' + (report.reviewerSubcon || '-') + ').' };
       }
-      sheet.getRange(row, 2).setValue('Approving SPV Mitra'); SpreadsheetApp.flush();
+      if (Number(report.reviewStage) === 1 && report.stage2Subcon) {
+        advanced = advanceReportToStage2Gas_(report, reviewerUser, notes);
+        sheet.getRange(row, 1, 1, 6).setValues([[String(report.submissionId), 'Pending SPV Mitra', JSON.stringify(report), new Date(), report.submitterName || '', report.siteId || '']]);
+        SpreadsheetApp.flush();
+      } else {
+        sheet.getRange(row, 2).setValue('Approving SPV Mitra'); SpreadsheetApp.flush();
+      }
     } else {
       if (!fallbackReport || String(fallbackReport.submissionId || '').trim() !== String(submissionId || '').trim()) return { success: false, error: 'Laporan pending tidak ditemukan. Muat ulang data lalu coba lagi.' };
       report = Object.assign({}, fallbackReport);
       if (String(report.approvalStatus || '').trim().toLowerCase() !== 'pending spv mitra') return { success: false, error: 'Laporan tidak lagi menunggu approval Supervisor Mitra.' };
-      var fallbackAssignedEmail = String(report.designatedSpvMitraEmail || '').trim().toLowerCase();
-      var fallbackReviewerEmail = String((reviewerUser && reviewerUser.email) || '').trim().toLowerCase();
-      if (fallbackAssignedEmail && fallbackAssignedEmail !== 'skip_spv_mitra' && fallbackAssignedEmail !== fallbackReviewerEmail) {
-        return { success: false, error: 'Laporan ini ditugaskan kepada Supervisor Mitra lain.' };
+      if (!canReviewPendingReportGas_(report, reviewerUser)) {
+        return { success: false, error: 'Laporan ini ditugaskan kepada Supervisor Mitra lain (' + (report.reviewerSubcon || '-') + ').' };
       }
-      sheet.appendRow([String(submissionId), 'Approving SPV Mitra', JSON.stringify(report), new Date(), report.submitterName || '', report.siteId || '']);
-      row = sheet.getLastRow();
+      if (Number(report.reviewStage) === 1 && report.stage2Subcon) {
+        advanced = advanceReportToStage2Gas_(report, reviewerUser, notes);
+        sheet.appendRow([String(submissionId), 'Pending SPV Mitra', JSON.stringify(report), new Date(), report.submitterName || '', report.siteId || '']);
+        SpreadsheetApp.flush();
+      } else {
+        sheet.appendRow([String(submissionId), 'Approving SPV Mitra', JSON.stringify(report), new Date(), report.submitterName || '', report.siteId || '']);
+        row = sheet.getLastRow();
+      }
     }
+    if (advanced) return advanceResultAfterLockGas_(report, advanced);
     var now = new Date();
     report.approvalStatus = 'Approved';
     report.spvMitraApprovedBy = String((reviewerUser && reviewerUser.name) || '');
     report.spvMitraApprovedAt = now.toISOString();
     report.approvedBy = String((reviewerUser && reviewerUser.name) || '');
     report.approvedAt = now.toISOString();
-    report.approvalNotes = notes || 'Disetujui oleh Supervisor Mitra';
+    report.approvalNotes = (notes || 'Disetujui oleh Supervisor Mitra') + (report.pemeriksa1ApprovedBy ? ' | Pemeriksa-1: ' + report.pemeriksa1ApprovedBy : '');
     report.spvMitraNotes = report.approvalNotes;
     sheet.getRange(row, 2, 1, 5).setValues([['Approving SPV Mitra', JSON.stringify(report), now, (reviewerUser && reviewerUser.name) || '', report.siteId || '']]);
     SpreadsheetApp.flush();
@@ -2160,7 +2362,7 @@ function deletePendingDailyReportGas(submissionId, reviewerUser) {
   try {
     var role = String((reviewerUser && reviewerUser.role) || '').trim().toLowerCase();
     var type = String((reviewerUser && reviewerUser.supervisorType) || '').trim().toLowerCase();
-    if (!(role === 'supervisor' && type === 'supervisor mitra')) return { success: false, error: 'Hanya Supervisor Mitra yang dapat menghapus laporan pending.' };
+    if (!(role === 'admin' || (role === 'supervisor' && type === 'supervisor mitra'))) return { success: false, error: 'Hanya Supervisor Mitra pemeriksa yang dapat menghapus laporan pending.' };
     lock = LockService.getScriptLock(); lock.waitLock(10000);
     var sheet = getPendingReportSheetGas_(), row = findPendingReportRowGas_(sheet, submissionId);
     if (row < 0) return { success: false, error: 'Laporan pending tidak ditemukan atau sudah diproses.' };
@@ -2169,10 +2371,8 @@ function deletePendingDailyReportGas(submissionId, reviewerUser) {
     var pendingValues = sheet.getRange(row, 1, 1, 6).getValues()[0];
     var pendingReport = {};
     try { pendingReport = JSON.parse(String(pendingValues[2] || '{}')); } catch (parseErr) {}
-    var assignedEmail = String(pendingReport.designatedSpvMitraEmail || '').trim().toLowerCase();
-    var reviewerEmail = String((reviewerUser && reviewerUser.email) || '').trim().toLowerCase();
-    if (assignedEmail && assignedEmail !== 'skip_spv_mitra' && assignedEmail !== reviewerEmail) {
-      return { success: false, error: 'Laporan ini ditugaskan kepada Supervisor Mitra lain.' };
+    if (!canReviewPendingReportGas_(pendingReport, reviewerUser)) {
+      return { success: false, error: 'Laporan ini ditugaskan kepada Supervisor Mitra lain (' + (pendingReport.reviewerSubcon || '-') + ').' };
     }
     var siteId = String(sheet.getRange(row, 6).getValue() || '');
     sheet.deleteRow(row); SpreadsheetApp.flush();
